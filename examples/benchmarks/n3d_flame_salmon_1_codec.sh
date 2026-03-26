@@ -1,11 +1,11 @@
 # Set the directory containing the scenes
 SCENE_DIR="/work/pi_rsitaram_umass_edu/tungi/datasets/neural3d"
 # Set the directory to store results
-RESULT_DIR="results_ori"
+RESULT_DIR="results_ori_codec"
 # Set the rendering trajectory path
 RENDER_TRAJ_PATH="ellipse"
 # List of scenes to process
-SCENE_LIST="flame_steak"
+SCENE_LIST="flame_salmon_1"
 # List of entropy lambda values (rate-distortion tradeoff parameter)
 ENTROPY_LAMBDA_LIST=(0.0005 0.001 0.002 0.004)
 # Data factor for training
@@ -22,11 +22,11 @@ for SCENE in $SCENE_LIST;
 do
     # Set TYPE based on the scene name
     if [ "$SCENE" = "coffee_martini" ]; then
-        TYPE=neur3d_2
+        TYPE=neur3d_2_codec
     elif [ "$SCENE" = "flame_salmon_1" ]; then
-        TYPE=neur3d_1
+        TYPE=neur3d_1_codec
     else
-        TYPE=neur3d_0
+        TYPE=neur3d_0_codec
     fi
 
     # Loop over each entropy lambda (rate)
@@ -75,37 +75,4 @@ do
         done
     done
 done
-
-
-# SCENE_DIR="/work/pi_rsitaram_umass_edu/tungi/datasets/neural3d"
-# RESULT_DIR="/work/pi_rsitaram_umass_edu/tungi/GIFStream/results_test_run"
-# SCENE="flame_steak"
-
-# # Script Constants
-# TYPE="neur3d_0"
-# DATA_FACTOR=2
-# GOP_SIZE=60
-# START_FRAME=0
-
-# CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py $TYPE \
-# --disable_viewer --data_factor $DATA_FACTOR --render_traj_path ellipse \
-# --data_dir $SCENE_DIR/$SCENE/ --result_dir $RESULT_DIR/$SCENE/GOP_0/r0 \
-# --eval_steps 7000 30000 --save_steps 7000 30000 --compression_sim \
-# --rd_lambda 0.0005 --entropy_model_opt --rate 0 --batch_size 1 \
-# --GOP_size $GOP_SIZE --knn --start_frame $START_FRAME
-
-
-# python examples/simple_trainer_GIFStream.py neur3d_0 \
-# --disable_viewer --data_factor 2 --render_traj_path ellipse \
-# --data_dir /work/pi_rsitaram_umass_edu/tungi/datasets/neural3d/flame_steak --result_dir results_test/flame_steak/GOP_0/r0 \
-# --eval_steps 7000 30000 --save_steps 7000 30000 --compression_sim \
-# --rd_lambda 0.0005 --entropy_model_opt --rate 0 --batch_size 1 \
-# --GOP_size 60 --knn --start_frame 0
-
-
-# python examples/simple_trainer_GIFStream.py neur3d_0 \
-#     --disable_viewer --data_factor 2 --render_traj_path ellipse \
-#     --data_dir /work/pi_rsitaram_umass_edu/tungi/datasets/neural3d/flame_steak --result_dir results_test/flame_steak/GOP_0/r0 \
-#     --ckpt results_test/flame_steak/GOP_0/r0/ckpts/ckpt_29999_rank0.pt \
-#     --compression end2end --rate $RATE_IDX --GOP_size 60 --knn --start_frame 0
 

@@ -75,7 +75,6 @@ class ProfilerConfig:
 
 @dataclass
 class Config:
-    # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
@@ -84,19 +83,19 @@ class Config:
     # Quantization parameters when set to hevc
     qp: Optional[int] = None
 
-    # Enable profiler
     profiler_enabled: bool = False
 
-    # Enable compression simulation
+    # Enable compression simulation (controls whether render uses quantized params)
     compression_sim: bool = False
 
-    # Enable entropy model
-    entropy_model_opt: bool = False
+    # Enable entropy model (controls whether you estimate bits + optimize entropy models)
+    entropy_model_opt: bool = False 
     # Define the type of entropy model
+
     entropy_model_type: Literal["conditional_gaussian_model"] = "conditional_gaussian_model"
     # Bit-rate distortion trade-off parameter
     rd_lambda: float = 5e-4 # default: 1e-2
-    # Steps to enable entropy model into training pipeline
+ 
     # conditional gaussian model:
     entropy_steps: Dict[str, int] = field(default_factory=lambda: {"anchors": -1, 
                                                                    "quats": 10_000, 
@@ -111,7 +110,6 @@ class Config:
     
     # Render trajectory path
     render_traj_path: str = "interp"
-
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
@@ -348,15 +346,19 @@ def create_splats_with_optimizers(
     
     params = [
         # name, value, lr
-        ("anchors", torch.nn.Parameter(points), 0),
-        ("scales", torch.nn.Parameter(scales.requires_grad_(True)), 7e-3),
-        ("quats", torch.nn.Parameter(quats), 0),
-        ("opacities", torch.nn.Parameter(opacities), 0),
-        ("offsets", torch.nn.Parameter(offsets.requires_grad_(True)), 1e-2),
-        ("anchor_features", torch.nn.Parameter(anchor_features.requires_grad_(True)), 0.0075),
-        ("time_features", torch.nn.Parameter(time_features.requires_grad_(True)), 0.0075),
-        ("factors", torch.nn.Parameter(factors.requires_grad_(True)), 1e-3),
+        ("anchors", torch.nn.Parameter(points), 0),  # Nx3
+        ("scales", torch.nn.Parameter(scales.requires_grad_(True)), 7e-3),  # Nx6
+        ("quats", torch.nn.Parameter(quats), 0),  # Nx4
+        ("opacities", torch.nn.Parameter(opacities), 0),  # Nx1
+        ("offsets", torch.nn.Parameter(offsets.requires_grad_(True)), 1e-2),  # [N, k, 3]
+        ("anchor_features", torch.nn.Parameter(anchor_features.requires_grad_(True)), 0.0075),  # [N, C]
+        ("time_features", torch.nn.Parameter(time_features.requires_grad_(True)), 0.0075),  # [N, T, C_perframe]
+        ("factors", torch.nn.Parameter(factors.requires_grad_(True)), 1e-3),  # [N, 4]
     ]
+
+    # Q: Whay scales is in dimension Nx6 instead of Nx3? 
+    # A: The first 3 dimensions are for the spatial extent of the Gaussian in x,y,z directions, 
+    # and the last 3 dimensions are for the covariance which controls the anisotropy of the Gaussian.
 
     view_dim = 3 if view_adaptive else 0
     opacity_dist_dim = 1 if add_opacity_dist else 0
@@ -429,7 +431,10 @@ def create_splats_with_optimizers(
     return splats, decoders, optimizers, decoder_optimizers
 
 class Runner:
-    """Engine for training and testing."""
+    """Engine for training and testing.
+    train() -> rasterize_splats() -> get_neural_features() -> decode_features() -> rasterization()
+    
+    """
 
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
@@ -658,6 +663,7 @@ class Runner:
         # if step == -1 or step > self.cfg.max_steps // 6:
         #     visible_anchor_mask = torch.logical_or(visible_anchor_mask, torch.sigmoid(self.splats["factors"][:,1]) > 0.2 )
 
+        # compression_sim: do we read from self.splats or self.comp_sim_splats
         if not self.cfg.compression_sim:
             selected_features = self.splats["anchor_features"][visible_anchor_mask]  # [M, c]
             selected_anchors = self.splats["anchors"][visible_anchor_mask]  # [M, 3]
@@ -1074,7 +1080,6 @@ class Runner:
 
                     height, width = pixels.shape[1:3]
 
-
                     # sh schedule
                     sh_degree_to_use = None
 
@@ -1131,7 +1136,9 @@ class Runner:
                     scale_loss = info["scales"].prod(dim=1).mean()
                     reg_loss = info["reg_loss"]
                     smooth_loss = info["smooth_loss"]
-                    # entropy constraint
+
+                    # entropy constraint (esti_bits_dict only exists if you called simulate_compression)
+                    # So in practice, entropy_model_opt only makes sense together with compression_sim=True
                     if cfg.entropy_model_opt and step>self.entropy_min_step:
                         total_esti_bits = 0
                         for n, n_step in cfg.entropy_steps.items():
@@ -1457,7 +1464,13 @@ class Runner:
 
     @torch.no_grad()
     def run_compression(self, step: int):
-        """Entry for running compression."""
+        """Entry for running compression.
+        - writes actual compressed files to result_dir/compression/rank0/
+        - writes netspt containing
+            - decoders weights
+            - entropy model weights
+            - scaling
+        """
         print("Running compression...")
         world_rank = self.world_rank
 
@@ -1470,7 +1483,15 @@ class Runner:
         self.run_param_distribution_vis(self.splats, save_dir=f"{cfg.result_dir}/visualization/raw")
         
         if isinstance(self.compression_method, GIFStreamEnd2endCompression):
-            self.compression_method.compress(compress_dir, self.comp_sim_splats, self.entropy_models, self.cfg.entropy_channel, self.cfg.c_perframe, self.scaling, self.cfg.voxel_size)
+            # Only scales, anchor_features, offsets, factors, time_features are quantized
+            # anchors, quats and opacities are not quantized
+            self.compression_method.compress(compress_dir, 
+                                             self.comp_sim_splats, 
+                                             self.entropy_models, 
+                                             self.cfg.entropy_channel, 
+                                             self.cfg.c_perframe, 
+                                             self.scaling, 
+                                             self.cfg.voxel_size)
             nets = {}
             nets["decoders"] = self.decoders.state_dict()
             for name, entropy_model in self.entropy_models.items():
@@ -1487,6 +1508,7 @@ class Runner:
         splats_c = self.compression_method.decompress(compress_dir, self.entropy_models, self.device)
         
         self.run_param_distribution_vis(splats_c, save_dir=f"{cfg.result_dir}/visualization/quant")
+        # Use the decompressed splats for evaluation and rendering
         for k in splats_c.keys():
             self.splats[k].data = splats_c[k].to(self.device)
         if self.cfg.knn:
@@ -1707,6 +1729,18 @@ if __name__ == "__main__":
                 app_embed_dim=6,
             ),
         ),
+        "neur3d_0_codec": (
+            "neur3d dataset",
+            Config(
+                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005,deformation_gate=0.03),
+                test_set=[0],
+                normalize_world_space=False,
+                anchor_feature_dim=24,
+                c_perframe = 3,
+                app_opt=True,
+                app_embed_dim=6,
+            ),
+        ),
         "neur3d_1": (
             "neur3d dataset",
             Config(
@@ -1715,6 +1749,17 @@ if __name__ == "__main__":
                 normalize_world_space=False,
                 anchor_feature_dim=48,
                 c_perframe = 4,
+                app_opt=False,
+            ),
+        ),
+        "neur3d_1_codec": (
+            "neur3d dataset",
+            Config(
+                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
+                test_set=[0],
+                normalize_world_space=False,
+                anchor_feature_dim=48,
+                c_perframe = 3,
                 app_opt=False,
             ),
         ),
@@ -1727,6 +1772,18 @@ if __name__ == "__main__":
                 normalize_world_space=False,
                 anchor_feature_dim=48,
                 c_perframe = 4,
+                app_opt=False,
+            ),
+        ),
+        "neur3d_2_codec": (
+            "neur3d dataset",
+            Config(
+                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
+                test_set=[0],
+                remove_set=[12],
+                normalize_world_space=False,
+                anchor_feature_dim=48,
+                c_perframe = 3,
                 app_opt=False,
             ),
         ),

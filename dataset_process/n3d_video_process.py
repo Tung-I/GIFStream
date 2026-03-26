@@ -186,7 +186,7 @@ def getcolmapsinglen3d(folder, offset):
 if __name__ == "__main__" :
     parser = ArgumentParser(description="dataset information")
     parser.add_argument("--root_dir", type=str, default = None)
-    parser.add_argument("--extract_frames", type=bool, action='store_true')
+    parser.add_argument("--extract_frames", action='store_true')
     parser.add_argument("--frame_rate", type=int, default = 30)
     parser.add_argument("--startframe", default=0, type=int)
     parser.add_argument("--endframe", default=300, type=int)

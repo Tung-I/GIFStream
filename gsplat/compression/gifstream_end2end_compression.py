@@ -127,6 +127,7 @@ class GIFStreamEnd2endCompression:
             kwargs = {
                 "n_sidelen": n_sidelen,
                 "verbose": self.verbose,
+                # quantized anchor_features are used
                 "anchor_features": torch.round(splats["anchor_features"]/scaling["anchor_features"]) * scaling["anchor_features"],
                 "c_channel": c_channel,
                 "p_channel": p_channel,
