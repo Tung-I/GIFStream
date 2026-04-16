@@ -20,13 +20,10 @@ Then it produces (under out_dir):
 
 Usage
 -----
-python examples/simple_eval_GIFStream.py \
+python examples/eval_end2end_GIFStream.py \
   --compress_dir results_ori_codec/flame_steak/GOP_0/r0/compression/rank0 \
   --out_dir      results_ori/flame_steak/GOP_0/r0/my_eval 
 
-python examples/simple_eval_GIFStream.py \
-  --compress_dir results_ori_codec/flame_steak/GOP_0/r0/compression/rank0 \
-    --out_dir      results_ori_codec/flame_steak/GOP_0/r0/my_eval 
 
 Notes
 -----

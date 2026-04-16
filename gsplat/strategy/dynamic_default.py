@@ -1,4 +1,4 @@
-# dynamic_default_strategy.py
+# dynamic_default.py
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Union
 
@@ -29,13 +29,14 @@ class DynamicDefaultStrategy:
     revised_opacity: bool = False
     absgrad: bool = False
     verbose: bool = False
+    min_visible_frames: int = 1
     key_for_gradient: str = "means2d"
 
     def initialize_state(self, scene_scale: float) -> Dict[str, Any]:
         return {
-            "grad2d": None,       # [N]
-            "count": None,        # [N]
-            "radii": None,        # [N] or None
+            "grad2d": None,       # [T, N]
+            "count": None,        # [T, N]
+            "radii": None,        # [T, N] or None
             "scene_scale": scene_scale,
         }
 
@@ -51,7 +52,7 @@ class DynamicDefaultStrategy:
         info[self.key_for_gradient].retain_grad()
 
     def _update_state(self, params, state, info, packed: bool = False):
-        for key in ["width", "height", "n_cameras", "radii", "gaussian_ids", self.key_for_gradient]:
+        for key in ["width", "height", "n_cameras", "radii", "gaussian_ids", self.key_for_gradient, "frame_idx"]:
             assert key in info, f"{key} missing"
 
         if self.absgrad:
@@ -62,53 +63,48 @@ class DynamicDefaultStrategy:
         grads[..., 0] *= info["width"] / 2.0 * info["n_cameras"]
         grads[..., 1] *= info["height"] / 2.0 * info["n_cameras"]
 
-        n_gaussian = params["means"].shape[1]  # [T, N, 3] -> Gaussian axis is dim=1
+        n_frames = params["means"].shape[0]
+        n_gaussian = params["means"].shape[1]
+        frame_idx = int(info["frame_idx"])
 
         if state["grad2d"] is None:
-            state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
+            state["grad2d"] = torch.zeros((n_frames, n_gaussian), device=grads.device)
         if state["count"] is None:
-            state["count"] = torch.zeros(n_gaussian, device=grads.device)
+            state["count"] = torch.zeros((n_frames, n_gaussian), device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
-            state["radii"] = torch.zeros(n_gaussian, device=grads.device)
-
-        
+            state["radii"] = torch.zeros((n_frames, n_gaussian), device=grads.device)
 
         if packed:
-            gs_ids = info["gaussian_ids"]  # [nnz]
+            gs_ids = info["gaussian_ids"]
             radii = info["radii"]
             if radii.ndim > 1:
                 radii = radii.max(dim=-1).values
         else:
             radii_raw = info["radii"]
-            # Case A: radii is scalar per visible Gaussian, e.g. [C, N] or [N]
             if radii_raw.ndim == grads.ndim - 1:
                 sel = radii_raw > 0.0
                 radii = radii_raw[sel]
-
-            # Case B: radii is vector-valued per Gaussian, e.g. [C, N, 2]
             elif radii_raw.ndim == grads.ndim:
                 sel = (radii_raw > 0.0).all(dim=-1)
                 radii = radii_raw[sel].max(dim=-1).values
-
             else:
                 raise RuntimeError(
                     f"Unexpected radii/grads shapes: radii={tuple(radii_raw.shape)}, grads={tuple(grads.shape)}"
                 )
 
-            # Robust even if sel is 1D or 2D
             nz = sel.nonzero(as_tuple=False)
             if nz.numel() == 0:
                 return
             gs_ids = nz[:, -1]
             grads = grads[sel]
 
-        state["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-        state["count"].index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
+        state["grad2d"][frame_idx].index_add_(0, gs_ids, grads.norm(dim=-1))
+        state["count"][frame_idx].index_add_(0, gs_ids, torch.ones_like(gs_ids, dtype=torch.float32))
 
         if self.refine_scale2d_stop_iter > 0:
-            state["radii"][gs_ids] = torch.maximum(
-                state["radii"][gs_ids],
-                radii / float(max(info["width"], info["height"]))
+            state["radii"][frame_idx, gs_ids] = torch.maximum(
+                state["radii"][frame_idx, gs_ids],
+                radii / float(max(info["width"], info["height"])),
             )
 
     @torch.no_grad()
@@ -116,52 +112,58 @@ class DynamicDefaultStrategy:
         count = state["count"]
         grads = state["grad2d"] / count.clamp_min(1)
 
-        # Aggregate 3D size across time conservatively
         scale3d = torch.exp(params["scales"]).amax(dim=-1)     # [T, N]
-        scale3d_ref = scale3d.mean(dim=0)                      # [N]
+        seen = count >= self.min_visible_frames
         is_grad_high = grads > self.grow_grad2d
-        is_small = scale3d_ref <= self.grow_scale3d * state["scene_scale"]
+        is_small = scale3d <= self.grow_scale3d * state["scene_scale"]
 
-        is_dupli = is_grad_high & is_small
-        n_dupli = int(is_dupli.sum().item())
+        # Duplicate only when the trajectory is consistently small across
+        # the frames where it has actually been observed.
+        all_small_when_seen = torch.where(
+            seen, is_small, torch.ones_like(is_small, dtype=torch.bool)
+        ).all(dim=0)
+        any_grad_high = is_grad_high.any(dim=0)
 
-        is_split = is_grad_high & (~is_small)
+        is_dupli = any_grad_high & all_small_when_seen
+
+        # Split when there exists at least one frame where the trajectory is
+        # both high-gradient and already large.
+        is_split = (is_grad_high & (~is_small)).any(dim=0)
+
         if self.refine_scale2d_stop_iter > 0 and step < self.refine_scale2d_stop_iter:
-            is_split |= state["radii"] > self.grow_scale2d
+            is_split |= ((state["radii"] > self.grow_scale2d) & seen).any(dim=0)
+
+        is_split &= ~is_dupli
+
+        n_dupli = int(is_dupli.sum().item())
         n_split = int(is_split.sum().item())
 
         if n_dupli > 0:
             dynamic_duplicate(params, optimizers, state, is_dupli)
 
-        if n_dupli > 0:
-            # appended children from duplicate should not be split in same round
-            is_split = torch.cat(
-                [is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)],
-                dim=0
-            )
-
         if n_split > 0:
+            if n_dupli > 0:
+                is_split = torch.cat(
+                    [is_split, torch.zeros(n_dupli, dtype=torch.bool, device=is_split.device)],
+                    dim=0,
+                )
             dynamic_split(
-                params, optimizers, state, is_split,
-                revised_opacity=self.revised_opacity
+                params, optimizers, state, is_split, revised_opacity=self.revised_opacity
             )
 
         return n_dupli, n_split
 
     @torch.no_grad()
     def _prune_gs(self, params, optimizers, state, step: int) -> int:
-        # Conservative synchronized prune:
-        # only prune if low-opacity across the entire trajectory
         opa = torch.sigmoid(params["opacities"])               # [T, N]
         opa_ref = opa.max(dim=0).values                        # [N]
-
         is_prune = opa_ref < self.prune_opa
 
         if step > self.reset_every:
             scale3d = torch.exp(params["scales"]).amax(dim=-1) # [T, N]
             too_big = scale3d.max(dim=0).values > self.prune_scale3d * state["scene_scale"]
-            if self.refine_scale2d_stop_iter > 0 and step < self.refine_scale2d_stop_iter:
-                too_big |= state["radii"] > self.prune_scale2d
+            if self.refine_scale2d_stop_iter > 0:
+                too_big |= state["radii"].max(dim=0).values > self.prune_scale2d
             is_prune |= too_big
 
         n_prune = int(is_prune.sum().item())
@@ -201,6 +203,7 @@ class DynamicDefaultStrategy:
             state["count"].zero_()
             if state["radii"] is not None:
                 state["radii"].zero_()
+            torch.cuda.empty_cache()
 
         if step % self.reset_every == 0 and step > 0:
             dynamic_reset_opa(params, optimizers, value=self.prune_opa * 2.0)

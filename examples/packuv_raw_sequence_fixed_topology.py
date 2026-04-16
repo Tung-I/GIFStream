@@ -1,0 +1,1411 @@
+
+"""
+too many dynamic Gaussians → raise flow_mag_threshold or lower gaussian_mask_sigma
+too few dynamic Gaussians → lower flow_mag_threshold or raise gaussian_mask_sigma
+
+python examples/packuv_raw_sequence_fixed_topology.py \
+  --data_dir /work/pi_rsitaram_umass_edu/tungi/datasets/neural3d/flame_steak \
+  --data_factor 2 \
+  --GOP_size 30 \
+  --start_frame 0 \
+  --test_set 0 \
+  --result_dir results_packuv_raw_sequence/flame_steak-sigma2.0-threshold2.0  \
+  --gaussian_mask_sigma 2.0 \
+  --flow_mag_threshold 2.0 \
+  --exp_name flame-steak-mask-sigma2.0-threshold2.0  
+
+"""
+
+
+import json
+import math
+import os
+import re
+import re
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import imageio.v2 as imageio
+import numpy as np
+import torch
+import torch.nn.functional as F
+import tqdm
+import tyro
+import wandb
+import yaml
+from fused_ssim import fused_ssim
+from torch import Tensor
+from torchvision.models.optical_flow import (
+    Raft_Large_Weights,
+    Raft_Small_Weights,
+    raft_large,
+    raft_small,
+)
+
+from datasets.GIFStream_new import Dataset, Parser
+from gsplat.cuda._wrapper import proj, quat_scale_to_covar_preci, world_to_cam
+from gsplat.rendering import rasterization
+from gsplat.strategy import DefaultStrategy
+from utils import knn, rgb_to_sh, set_random_seed
+
+
+class FrameSubset(torch.utils.data.Dataset):
+    """
+    Robust frame subset that does not rely on Dataset.__getitem__ metadata.
+    It uses base_dataset.indices directly so it remains correct even when
+    camera subsets are filtered by train/test/remove lists.
+    """
+
+    def __init__(self, base_dataset: Dataset, target_frame: int, gop_size: int):
+        self.base = base_dataset
+        self.target_frame = target_frame
+        self.gop_size = gop_size
+        self.base_indices: List[int] = []
+
+        for i in range(len(base_dataset)):
+            linear_idx = int(base_dataset.indices[i])
+            frame_idx = linear_idx % gop_size
+            if frame_idx == target_frame:
+                self.base_indices.append(i)
+
+        if len(self.base_indices) == 0:
+            raise RuntimeError(f"No samples found for frame {target_frame}")
+
+    def __len__(self) -> int:
+        return len(self.base_indices)
+
+    def __getitem__(self, idx: int):
+        base_i = self.base_indices[idx]
+        data = dict(self.base[base_i])
+
+        linear_idx = int(self.base.indices[base_i])
+        cam_idx = linear_idx // self.gop_size
+        frame_idx = linear_idx % self.gop_size + self.base.start_frame
+
+        data["dataset_idx"] = base_i
+        data["linear_idx"] = linear_idx
+        data["cam_idx"] = cam_idx
+        data["frame_idx"] = frame_idx
+        data["frame_local_idx"] = frame_idx - self.base.start_frame
+        data["camera_id_stable"] = int(self.base.parser.camera_ids[cam_idx])
+        return data
+
+
+@dataclass
+class Config:
+    # Data
+    data_dir: str = "data/Neur3D/flame_steak"
+    data_factor: int = 2
+    result_dir: str = "results/flame_steak_packuv_raw_sequence"
+    exp_name: Optional[str] = None
+    test_every: int = 8
+    normalize_world_space: bool = True
+    global_scale: float = 1.0
+    patch_size: Optional[int] = None
+
+    # Video / GOP
+    GOP_size: int = 60
+    start_frame: int = 0
+    test_set: Optional[List[int]] = field(default_factory=lambda: [0])
+    remove_set: Optional[List[int]] = None
+
+    # Optimization
+    batch_size: int = 1
+    seed: int = 42
+
+    # Vanilla 3DGS params
+    init_type: str = "sfm"
+    init_num_pts: int = 100_000
+    init_extent: float = 3.0
+    init_opa: float = 0.1
+    init_scale: float = 1.0
+    sh_degree: int = 0
+
+    # Rendering / loss
+    ssim_lambda: float = 0.2
+    near_plane: float = 0.01
+    far_plane: float = 1e10
+    packed: bool = False
+    antialiased: bool = False
+    camera_model: str = "pinhole"
+    random_bkgd: bool = False
+    scale_reg: float = 0.0
+
+    # Learning rates
+    lr_means: float = 1.6e-4
+    lr_scales: float = 5e-3
+    lr_quats: float = 1e-3
+    lr_opacities: float = 5e-2
+    lr_sh0: float = 2.5e-3
+    lr_shN: float = 2.5e-3 / 20.0
+
+    # I-frame strategy (keep full gsplat densification/pruning only here)
+    strategy_prune_opa: float = 0.005
+    strategy_grow_grad2d: float = 0.0002
+    strategy_grow_scale3d: float = 0.01
+    strategy_grow_scale2d: float = 0.05
+    strategy_prune_scale3d: float = 0.1
+    strategy_prune_scale2d: float = 0.15
+    strategy_refine_scale2d_stop_iter: int = 0
+    strategy_refine_start_iter: int = 500
+    strategy_refine_stop_iter: int = 15_000
+    strategy_reset_every: int = 3000
+    strategy_refine_every: int = 100
+    strategy_pause_refine_after_reset: int = 0
+    strategy_revised_opacity: bool = False
+    strategy_absgrad: bool = False
+    strategy_verbose: bool = True
+
+    # Temporal regularization (kept optional for future use)
+    lambda_mean_vel: float = 1e-4
+    lambda_mean_acc: float = 5e-5
+    lambda_scale_vel: float = 5e-5
+    lambda_opa_vel: float = 1e-5
+    lambda_quat_vel: float = 5e-5
+    lambda_sh0_vel: float = 1e-5
+    lambda_shN_vel: float = 1e-6
+    enable_temporal_loss: bool = False
+
+    # Flow-guided Gaussian labeling
+    use_flow_guided_labeling: bool = True
+    raft_variant: str = "large"  # large / small
+    flow_max_side: int = 768
+    # This thresholds the RAFT flow magnitude before dilation.
+    # Lowering it marks more image pixels as moving. 
+    flow_dilate_radius: int = 7
+    flow_mag_threshold: float = 2.0 
+    flow_cache_on_cpu: bool = True
+
+    # Covariance-aware masking
+    use_covariance_aware_masking: bool = True
+    center_only_fallback: bool = False
+    label_camera_stride: int = 1
+    label_max_cameras: int = -1
+    # This controls the Mahalanobis ellipse test in covariance-aware masking. 
+    # Larger gaussian_mask_sigma means a larger accepted ellipse,
+    # so a Gaussian is more likely to overlap the motion mask and be labeled dynamic. 
+    gaussian_mask_sigma: float = 2.0
+    gaussian_mask_scan_scale: float = 3.0
+    gaussian_mask_radius_cap: int = 64
+    gaussian_mask_eps: float = 1e-5
+
+    # Gradient freezing
+    freeze_static_gaussians: bool = True
+    reset_static_momentum_every: int = 200
+
+    # Logging / schedule
+    log_every: int = 100
+    iframe_steps: int = 5_000
+    pframe_steps: int = 2_500
+    iframe_eval_steps: List[int] = field(default_factory=lambda: [2500, 5000])
+    pframe_eval_every: int = 500
+
+    # Utilities
+    save_stage_ckpts: bool = True
+    ckpt: Optional[str] = None
+    save_motion_masks_debug: bool = False
+
+    # WandB
+    use_wandb: bool = True
+    wandb_project: str = "packuv-raw-sequence-gsplat"
+    wandb_entity: Optional[str] = None
+    wandb_name: Optional[str] = None
+    wandb_run_id: Optional[str] = None
+    wandb_resume: str = "allow"
+    wandb_mode: str = "online"  # online / offline / disabled
+
+
+def create_optimizers_for_static_splats(
+    splats: torch.nn.ParameterDict,
+    cfg: Config,
+    scene_scale: float,
+    batch_size: int,
+) -> Dict[str, torch.optim.Optimizer]:
+    bs = batch_size
+    betas = (1 - bs * (1 - 0.9), 1 - bs * (1 - 0.999))
+    eps = 1e-15 / math.sqrt(bs)
+
+    return {
+        "means": torch.optim.Adam(
+            [{"params": splats["means"], "lr": cfg.lr_means * scene_scale * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+        "scales": torch.optim.Adam(
+            [{"params": splats["scales"], "lr": cfg.lr_scales * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+        "quats": torch.optim.Adam(
+            [{"params": splats["quats"], "lr": cfg.lr_quats * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+        "opacities": torch.optim.Adam(
+            [{"params": splats["opacities"], "lr": cfg.lr_opacities * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+        "sh0": torch.optim.Adam(
+            [{"params": splats["sh0"], "lr": cfg.lr_sh0 * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+        "shN": torch.optim.Adam(
+            [{"params": splats["shN"], "lr": cfg.lr_shN * math.sqrt(bs)}],
+            eps=eps,
+            betas=betas,
+        ),
+    }
+
+
+class DynamicVanillaGS(torch.nn.Module):
+    """
+    One shared Gaussian topology across all frames.
+    Frame 0 gets vanilla gsplat densification/pruning.
+    Later frames inherit that fixed topology and are only fine-tuned.
+    """
+
+    def __init__(self, parser: Parser, cfg: Config, scene_scale: float, device: str) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.device = device
+        self.T = cfg.GOP_size
+        self.scene_scale = scene_scale
+
+        if cfg.init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif cfg.init_type == "random":
+            points = cfg.init_extent * scene_scale * (torch.rand((cfg.init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((cfg.init_num_pts, 3))
+        else:
+            raise ValueError("init_type must be 'sfm' or 'random'.")
+
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
+        dist_avg = torch.sqrt(dist2_avg.clamp_min(1e-12))
+        scales = torch.log((dist_avg * cfg.init_scale).clamp_min(1e-6)).unsqueeze(-1).repeat(1, 3)
+
+        n = points.shape[0]
+        quats = F.normalize(torch.rand((n, 4)), dim=-1)
+        opacities = torch.logit(torch.full((n,), cfg.init_opa))
+
+        colors = torch.zeros((n, (cfg.sh_degree + 1) ** 2, 3))
+        colors[:, 0, :] = rgb_to_sh(rgbs)
+        sh0 = colors[:, :1, :]
+        shN = colors[:, 1:, :]
+
+        self.splats = torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(points.unsqueeze(0).repeat(self.T, 1, 1).contiguous()),
+                "scales": torch.nn.Parameter(scales.unsqueeze(0).repeat(self.T, 1, 1).contiguous()),
+                "quats": torch.nn.Parameter(quats.unsqueeze(0).repeat(self.T, 1, 1).contiguous()),
+                "opacities": torch.nn.Parameter(opacities.unsqueeze(0).repeat(self.T, 1).contiguous()),
+                "sh0": torch.nn.Parameter(sh0.unsqueeze(0).repeat(self.T, 1, 1, 1).contiguous()),
+                "shN": torch.nn.Parameter(shN.unsqueeze(0).repeat(self.T, 1, 1, 1).contiguous()),
+            }
+        ).to(device)
+
+    @torch.no_grad()
+    def make_static_splats_from_frame(self, t: int = 0) -> torch.nn.ParameterDict:
+        return torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(self.splats["means"][t].detach().clone()),
+                "scales": torch.nn.Parameter(self.splats["scales"][t].detach().clone()),
+                "quats": torch.nn.Parameter(self.splats["quats"][t].detach().clone()),
+                "opacities": torch.nn.Parameter(self.splats["opacities"][t].detach().clone()),
+                "sh0": torch.nn.Parameter(self.splats["sh0"][t].detach().clone()),
+                "shN": torch.nn.Parameter(self.splats["shN"][t].detach().clone()),
+            }
+        ).to(self.device)
+
+    @torch.no_grad()
+    def repeat_from_static_splats(self, static_splats: torch.nn.ParameterDict) -> None:
+        self.splats = torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(static_splats["means"].detach()[None].repeat(self.T, 1, 1).contiguous()),
+                "scales": torch.nn.Parameter(static_splats["scales"].detach()[None].repeat(self.T, 1, 1).contiguous()),
+                "quats": torch.nn.Parameter(static_splats["quats"].detach()[None].repeat(self.T, 1, 1).contiguous()),
+                "opacities": torch.nn.Parameter(static_splats["opacities"].detach()[None].repeat(self.T, 1).contiguous()),
+                "sh0": torch.nn.Parameter(static_splats["sh0"].detach()[None].repeat(self.T, 1, 1, 1).contiguous()),
+                "shN": torch.nn.Parameter(static_splats["shN"].detach()[None].repeat(self.T, 1, 1, 1).contiguous()),
+            }
+        ).to(self.device)
+
+    @torch.no_grad()
+    def rebuild_from_state_dict(self, splat_state_dict: Dict[str, Tensor]) -> None:
+        checkpoint_T = int(splat_state_dict["means"].shape[0])
+        if checkpoint_T != self.T:
+            raise ValueError(
+                f"Checkpoint GOP/frame count mismatch: checkpoint has T={checkpoint_T}, current cfg has T={self.T}."
+            )
+
+        self.splats = torch.nn.ParameterDict({
+            k: torch.nn.Parameter(v.detach().to(self.device).clone().contiguous())
+            for k, v in splat_state_dict.items()
+        }).to(self.device)
+
+    def frame_state(self, t: int) -> Dict[str, Tensor]:
+        return {
+            "means": self.splats["means"][t],
+            "scales": self.splats["scales"][t],
+            "quats": F.normalize(self.splats["quats"][t], dim=-1),
+            "opacities": self.splats["opacities"][t],
+            "sh0": self.splats["sh0"][t],
+            "shN": self.splats["shN"][t],
+        }
+
+    @torch.no_grad()
+    def copy_frame(self, src: int, dst: int) -> None:
+        for k in self.splats.keys():
+            self.splats[k].data[dst].copy_(self.splats[k].data[src])
+
+    def create_optimizers(self, batch_size: int) -> Dict[str, torch.optim.Optimizer]:
+        bs = batch_size
+        betas = (1 - bs * (1 - 0.9), 1 - bs * (1 - 0.999))
+        eps = 1e-15 / math.sqrt(bs)
+        return {
+            "means": torch.optim.Adam(
+                [{"params": self.splats["means"], "lr": self.cfg.lr_means * self.scene_scale * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+            "scales": torch.optim.Adam(
+                [{"params": self.splats["scales"], "lr": self.cfg.lr_scales * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+            "quats": torch.optim.Adam(
+                [{"params": self.splats["quats"], "lr": self.cfg.lr_quats * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+            "opacities": torch.optim.Adam(
+                [{"params": self.splats["opacities"], "lr": self.cfg.lr_opacities * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+            "sh0": torch.optim.Adam(
+                [{"params": self.splats["sh0"], "lr": self.cfg.lr_sh0 * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+            "shN": torch.optim.Adam(
+                [{"params": self.splats["shN"], "lr": self.cfg.lr_shN * math.sqrt(bs)}],
+                eps=eps,
+                betas=betas,
+            ),
+        }
+
+
+def quat_temporal_loss(q0: Tensor, q1: Tensor) -> Tensor:
+    q0 = F.normalize(q0, dim=-1)
+    q1 = F.normalize(q1, dim=-1)
+    cos = (q0 * q1).sum(dim=-1).abs().clamp(max=1.0)
+    return (1.0 - cos).mean()
+
+
+def smooth_l1(x: Tensor, y: Tensor) -> Tensor:
+    return F.smooth_l1_loss(x, y)
+
+
+def compute_temporal_regularization(
+    model: DynamicVanillaGS, t: int, cfg: Config
+) -> Tuple[Tensor, Dict[str, float]]:
+    T = model.T
+    terms: Dict[str, Tensor] = {}
+
+    if t > 0:
+        terms["mean_vel"] = smooth_l1(model.splats["means"][t], model.splats["means"][t - 1])
+        terms["scale_vel"] = smooth_l1(model.splats["scales"][t], model.splats["scales"][t - 1])
+        terms["opa_vel"] = smooth_l1(model.splats["opacities"][t], model.splats["opacities"][t - 1])
+        terms["quat_vel"] = quat_temporal_loss(model.splats["quats"][t], model.splats["quats"][t - 1])
+        terms["sh0_vel"] = smooth_l1(model.splats["sh0"][t], model.splats["sh0"][t - 1])
+
+    if 0 < t < T - 1:
+        v_prev = model.splats["means"][t] - model.splats["means"][t - 1]
+        v_next = model.splats["means"][t + 1] - model.splats["means"][t]
+        terms["mean_acc"] = smooth_l1(v_next, v_prev)
+
+    loss = torch.zeros([], device=model.device)
+    loss = loss + cfg.lambda_mean_vel * terms.get("mean_vel", torch.zeros([], device=model.device))
+    loss = loss + cfg.lambda_mean_acc * terms.get("mean_acc", torch.zeros([], device=model.device))
+    loss = loss + cfg.lambda_scale_vel * terms.get("scale_vel", torch.zeros([], device=model.device))
+    loss = loss + cfg.lambda_opa_vel * terms.get("opa_vel", torch.zeros([], device=model.device))
+    loss = loss + cfg.lambda_quat_vel * terms.get("quat_vel", torch.zeros([], device=model.device))
+    loss = loss + cfg.lambda_sh0_vel * terms.get("sh0_vel", torch.zeros([], device=model.device))
+
+    stats = {k: float(v.detach().item()) for k, v in terms.items()}
+    return loss, stats
+
+
+class Runner:
+    def __init__(self, cfg: Config) -> None:
+        assert cfg.batch_size == 1, "This trainer assumes batch_size=1."
+        if cfg.use_flow_guided_labeling and cfg.patch_size is not None:
+            raise ValueError("Flow-guided labeling assumes full-frame images, so patch_size must be None.")
+
+        set_random_seed(cfg.seed)
+        self.cfg = cfg
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        os.makedirs(cfg.result_dir, exist_ok=True)
+        self.ckpt_dir = os.path.join(cfg.result_dir, "ckpts")
+        self.motion_dir = os.path.join(cfg.result_dir, "motion_masks")
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        os.makedirs(self.motion_dir, exist_ok=True)
+
+        with open(os.path.join(cfg.result_dir, "config.yaml"), "w") as f:
+            yaml.safe_dump(asdict(cfg), f, sort_keys=False)
+
+        self.resume_ckpt_metadata = self._peek_resume_metadata(cfg.ckpt) if cfg.ckpt is not None else {}
+        self.wandb_run_id_path = os.path.join(cfg.result_dir, "wandb_run_id.txt")
+        effective_wandb_run_id = self._resolve_wandb_run_id()
+
+        self.wandb_run = None
+        if cfg.use_wandb and cfg.wandb_mode != "disabled":
+            self.wandb_run = wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity,
+                name=(cfg.exp_name if cfg.exp_name is not None else cfg.wandb_name),
+                id=effective_wandb_run_id,
+                resume=cfg.wandb_resume,
+                mode=cfg.wandb_mode,
+                dir=cfg.result_dir,
+                config=asdict(cfg),
+            )
+            try:
+                with open(self.wandb_run_id_path, "w") as f:
+                    f.write(str(self.wandb_run.id).strip() + "\n")
+            except OSError:
+                pass
+
+        self.parser = Parser(
+            data_dir=cfg.data_dir,
+            factor=cfg.data_factor,
+            normalize=cfg.normalize_world_space,
+            test_every=cfg.test_every,
+            first_frame=cfg.start_frame,
+        )
+        self.trainset = Dataset(
+            self.parser,
+            split="train",
+            patch_size=cfg.patch_size,
+            load_depths=False,
+            test_set=cfg.test_set,
+            remove_set=cfg.remove_set,
+            GOP_size=cfg.GOP_size,
+            start_frame=cfg.start_frame,
+        )
+        self.valset = Dataset(
+            self.parser,
+            split="val",
+            patch_size=None,
+            load_depths=False,
+            test_set=cfg.test_set,
+            remove_set=cfg.remove_set,
+            GOP_size=cfg.GOP_size,
+            start_frame=cfg.start_frame,
+        )
+
+        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
+        self.model = DynamicVanillaGS(self.parser, cfg, self.scene_scale, self.device)
+        self.optimizers = self.model.create_optimizers(cfg.batch_size)
+        self.schedulers = {
+            "means": torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max(cfg.pframe_steps, 1))
+            )
+        }
+
+        # Stable train camera list, independent of Dataset.__getitem__ metadata.
+        train_camera_ids = sorted({int(self.trainset.indices[i]) // cfg.GOP_size for i in range(len(self.trainset))})
+        self.train_cam_indices = train_camera_ids
+
+        self.flow_model = None
+        self.motion_mask_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+
+        # WandB logging now uses per-frame folders directly, e.g.
+        # frame_007/train/loss and frame_007/val/psnr.
+        # We keep an empty placeholder for backward compatibility with older checkpoints
+        # that may still contain frame_metric_history.
+        self.frame_metric_history: Dict[str, Dict] = {}
+
+        self.resume_global_step = 0
+        self.resume_next_frame_local_idx = 0
+        self.resume_ckpt_path: Optional[str] = None
+
+        if cfg.ckpt is not None:
+            self.load_ckpt(cfg.ckpt)
+
+    def _peek_resume_metadata(self, ckpt_path: Optional[str]) -> Dict:
+        if ckpt_path is None or (not os.path.exists(ckpt_path)):
+            return {}
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+        except Exception as e:
+            print(f"Warning: failed to peek checkpoint metadata from {ckpt_path}: {e}")
+            return {}
+        meta = {
+            "step": int(ckpt.get("step", 0)),
+            "next_frame_local_idx": ckpt.get("next_frame_local_idx", None),
+            "last_completed_frame_local_idx": ckpt.get("last_completed_frame_local_idx", None),
+            "wandb_run_id": ckpt.get("wandb_run_id", None),
+        }
+        return meta
+
+    def _extract_wandb_run_id_from_dirname(self, name: str) -> Optional[str]:
+        base = os.path.basename(os.path.realpath(name.rstrip(os.sep)))
+        m = re.match(r"(?:offline-)?run-[0-9_\-]+-([A-Za-z0-9]+)$", base)
+        if m is not None:
+            return m.group(1)
+        return None
+
+    def _find_local_wandb_run_id(self) -> Optional[str]:
+        wandb_root = os.path.join(self.cfg.result_dir, "wandb")
+        if not os.path.isdir(wandb_root):
+            return None
+
+        latest_link = os.path.join(wandb_root, "latest-run")
+        if os.path.exists(latest_link):
+            rid = self._extract_wandb_run_id_from_dirname(latest_link)
+            if rid is not None:
+                return rid
+
+        candidates = []
+        for name in os.listdir(wandb_root):
+            full = os.path.join(wandb_root, name)
+            if os.path.isdir(full) and (name.startswith("run-") or name.startswith("offline-run-")):
+                candidates.append(full)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for cand in candidates:
+            rid = self._extract_wandb_run_id_from_dirname(cand)
+            if rid is not None:
+                return rid
+        return None
+
+    def _resolve_wandb_run_id(self) -> Optional[str]:
+        if self.cfg.wandb_run_id:
+            return self.cfg.wandb_run_id
+
+        ckpt_rid = self.resume_ckpt_metadata.get("wandb_run_id", None)
+        if ckpt_rid:
+            return str(ckpt_rid)
+
+        if os.path.exists(self.wandb_run_id_path):
+            try:
+                rid = open(self.wandb_run_id_path, "r").read().strip()
+                if rid:
+                    return rid
+            except OSError:
+                pass
+
+        return self._find_local_wandb_run_id()
+
+    def _init_flow_model(self) -> None:
+        if self.flow_model is not None:
+            return
+
+        if self.cfg.raft_variant == "large":
+            weights = Raft_Large_Weights.DEFAULT
+            self.flow_model = raft_large(weights=weights, progress=True).to(self.device).eval()
+        elif self.cfg.raft_variant == "small":
+            weights = Raft_Small_Weights.DEFAULT
+            self.flow_model = raft_small(weights=weights, progress=True).to(self.device).eval()
+        else:
+            raise ValueError("raft_variant must be 'large' or 'small'.")
+
+        for p in self.flow_model.parameters():
+            p.requires_grad_(False)
+
+    def _linear_to_cam_and_frame(self, linear_idx: int) -> Tuple[int, int]:
+        cam_idx = int(linear_idx) // self.cfg.GOP_size
+        frame_idx = self.cfg.start_frame + (int(linear_idx) % self.cfg.GOP_size)
+        return cam_idx, frame_idx
+
+    def _load_full_view(self, cam_idx: int, frame_idx: int) -> Dict[str, Tensor]:
+        camera_path = self.parser.campaths[cam_idx]
+        image_path = os.path.join(camera_path, f"{(frame_idx + 1):05d}.png")
+        image = imageio.imread(image_path)[..., :3]
+        image = cv2.resize(
+            image,
+            dsize=(image.shape[1] // self.parser.factor, image.shape[0] // self.parser.factor),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        camera_id = self.parser.camera_ids[cam_idx]
+        K = self.parser.Ks_dict[camera_id].copy()
+        params = self.parser.params_dict[camera_id]
+        camtoworld = self.parser.camtoworlds[cam_idx]
+        mask = self.parser.mask_dict[camera_id]
+
+        if len(params) > 0:
+            mapx, mapy = self.parser.mapx_dict[camera_id], self.parser.mapy_dict[camera_id]
+            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            x, y, w, h = self.parser.roi_undist_dict[camera_id]
+            image = image[y : y + h, x : x + w]
+
+        data = {
+            "image": torch.from_numpy(image).float() / 255.0,
+            "K": torch.from_numpy(K).float(),
+            "camtoworld": torch.from_numpy(camtoworld).float(),
+            "camera_id_stable": int(camera_id),
+            "cam_idx": int(cam_idx),
+            "frame_idx": int(frame_idx),
+        }
+        if mask is not None:
+            data["mask"] = torch.from_numpy(mask).bool()
+        return data
+
+    @torch.no_grad()
+    def _compute_motion_mask(self, cam_idx: int, prev_frame_idx: int, cur_frame_idx: int) -> torch.Tensor:
+        cache_key = (cam_idx, cur_frame_idx)
+        if cache_key in self.motion_mask_cache:
+            return self.motion_mask_cache[cache_key].clone()
+
+        self._init_flow_model()
+
+        prev_view = self._load_full_view(cam_idx, prev_frame_idx)
+        cur_view = self._load_full_view(cam_idx, cur_frame_idx)
+
+        img1 = prev_view["image"].permute(2, 0, 1).unsqueeze(0).to(self.device)
+        img2 = cur_view["image"].permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        _, _, h, w = img1.shape
+        scale = min(1.0, float(self.cfg.flow_max_side) / float(max(h, w)))
+        if scale < 1.0:
+            h2 = max(8, int(round(h * scale / 8.0) * 8))
+            w2 = max(8, int(round(w * scale / 8.0) * 8))
+        else:
+            h2 = int(math.ceil(h / 8.0) * 8)
+            w2 = int(math.ceil(w / 8.0) * 8)
+
+        img1_r = F.interpolate(img1, size=(h2, w2), mode="bilinear", align_corners=False)
+        img2_r = F.interpolate(img2, size=(h2, w2), mode="bilinear", align_corners=False)
+
+        # RAFT expects float images in [-1, 1].
+        img1_r = img1_r * 2.0 - 1.0
+        img2_r = img2_r * 2.0 - 1.0
+
+        flow = self.flow_model(img1_r, img2_r)[-1]
+        flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)
+        flow[:, 0] *= float(w) / float(w2)
+        flow[:, 1] *= float(h) / float(h2)
+
+        mag = torch.linalg.norm(flow, dim=1)[0]
+        motion = mag > self.cfg.flow_mag_threshold
+
+        if "mask" in cur_view:
+            motion = motion & cur_view["mask"].to(self.device)
+
+        if self.cfg.flow_dilate_radius > 0:
+            k = self.cfg.flow_dilate_radius * 2 + 1
+            motion = F.max_pool2d(motion.float()[None, None], kernel_size=k, stride=1, padding=self.cfg.flow_dilate_radius)[0, 0] > 0.5
+
+        motion_out = motion.detach().cpu() if self.cfg.flow_cache_on_cpu else motion.detach()
+        self.motion_mask_cache[cache_key] = motion_out
+
+        if self.cfg.save_motion_masks_debug:
+            out_path = os.path.join(self.motion_dir, f"cam{cam_idx:03d}_frame{cur_frame_idx:05d}.png")
+            imageio.imwrite(out_path, (motion_out.numpy().astype(np.uint8) * 255))
+
+        return motion_out.clone()
+
+    @torch.no_grad()
+    def _gaussian_overlap_motion_mask(
+        self,
+        means2d: Tensor,   # [N, 2]
+        covars2d: Tensor,  # [N, 2, 2]
+        depths: Tensor,    # [N]
+        motion_mask: Tensor,  # [H, W] bool
+    ) -> torch.Tensor:
+        device = means2d.device
+        motion_mask = motion_mask.to(device)
+        H, W = motion_mask.shape
+        dynamic = torch.zeros(means2d.shape[0], dtype=torch.bool, device=device)
+
+        motion_ys, motion_xs = torch.nonzero(motion_mask, as_tuple=True)
+        if motion_ys.numel() == 0:
+            return dynamic
+
+        motion_xmin = int(motion_xs.min().item())
+        motion_xmax = int(motion_xs.max().item())
+        motion_ymin = int(motion_ys.min().item())
+        motion_ymax = int(motion_ys.max().item())
+
+        finite_covars = torch.isfinite(covars2d).all(dim=-1).all(dim=-1)
+        finite = torch.isfinite(means2d).all(dim=-1) & finite_covars
+        valid = finite & (depths > self.cfg.near_plane)
+
+        if self.cfg.center_only_fallback or (not self.cfg.use_covariance_aware_masking):
+            uv = means2d.round().long()
+            u = uv[:, 0].clamp(0, W - 1)
+            v = uv[:, 1].clamp(0, H - 1)
+            inside = valid & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            dynamic[inside] = motion_mask[v[inside], u[inside]]
+            return dynamic
+
+        sigma2 = self.cfg.gaussian_mask_sigma ** 2
+        eye = torch.eye(2, device=device, dtype=covars2d.dtype)
+
+        valid_ids = torch.where(valid)[0]
+        for idx in valid_ids.tolist():
+            mu = means2d[idx]
+            cov = covars2d[idx] + self.cfg.gaussian_mask_eps * eye
+
+            evals = torch.linalg.eigvalsh(cov)
+            lmax = float(torch.clamp(evals[-1], min=0.0).sqrt().item())
+            radius = int(math.ceil(self.cfg.gaussian_mask_scan_scale * lmax))
+            radius = min(radius, self.cfg.gaussian_mask_radius_cap)
+            if radius <= 0:
+                continue
+
+            uc = int(round(float(mu[0].item())))
+            vc = int(round(float(mu[1].item())))
+
+            # Quick reject using global motion bbox.
+            if uc + radius < motion_xmin or uc - radius > motion_xmax or vc + radius < motion_ymin or vc - radius > motion_ymax:
+                continue
+
+            xmin = max(0, uc - radius)
+            xmax = min(W - 1, uc + radius)
+            ymin = max(0, vc - radius)
+            ymax = min(H - 1, vc + radius)
+            if xmin > xmax or ymin > ymax:
+                continue
+
+            local_motion = motion_mask[ymin : ymax + 1, xmin : xmax + 1]
+            if not bool(local_motion.any()):
+                continue
+
+            ys, xs = torch.meshgrid(
+                torch.arange(ymin, ymax + 1, device=device),
+                torch.arange(xmin, xmax + 1, device=device),
+                indexing="ij",
+            )
+            pts = torch.stack([xs, ys], dim=-1).float() - mu
+            cov_inv = torch.linalg.inv(cov)
+            maha = torch.einsum("...i,ij,...j->...", pts, cov_inv, pts)
+            inside = maha <= sigma2
+            if bool((inside & local_motion).any()):
+                dynamic[idx] = True
+
+        return dynamic
+
+    @torch.no_grad()
+    def label_dynamic_gaussians(self, frame_idx: int) -> torch.Tensor:
+        """
+        Compute PackUV-style dynamic/static labels for one P-frame:
+        1) RAFT motion masks per camera
+        2) covariance-aware overlap test
+        3) OR across cameras
+        """
+        if frame_idx <= self.cfg.start_frame:
+            n = self.model.splats["means"].shape[1]
+            return torch.ones(n, dtype=torch.bool, device=self.device)
+
+        state = self.model.frame_state(frame_idx - self.cfg.start_frame)
+        means_world = state["means"]
+        scales = torch.exp(state["scales"])
+        quats = state["quats"]
+
+        covars3d, _ = quat_scale_to_covar_preci(quats, scales, compute_covar=True, compute_preci=False, triu=False)
+        assert covars3d is not None
+
+        dynamic = torch.zeros(means_world.shape[0], dtype=torch.bool, device=self.device)
+
+        cam_indices = self.train_cam_indices[:: max(1, self.cfg.label_camera_stride)]
+        if self.cfg.label_max_cameras > 0:
+            cam_indices = cam_indices[: self.cfg.label_max_cameras]
+
+        for cam_idx in tqdm.tqdm(cam_indices, desc=f"Label frame {frame_idx:03d}", leave=False):
+            cur_view = self._load_full_view(cam_idx, frame_idx)
+            motion_mask = self._compute_motion_mask(cam_idx, frame_idx - 1, frame_idx)
+
+            viewmat = torch.linalg.inv(cur_view["camtoworld"].to(self.device)).unsqueeze(0)   # [1, 4, 4]
+            K = cur_view["K"].to(self.device).unsqueeze(0)                                     # [1, 3, 3]
+            H, W = cur_view["image"].shape[:2]
+
+            means_cam, covars_cam = world_to_cam(
+                means_world,
+                covars3d,
+                viewmat,
+            )  # [1, N, 3], [1, N, 3, 3]
+
+            means2d, covars2d = proj(
+                means_cam,
+                covars_cam,
+                K,
+                width=W,
+                height=H,
+                camera_model=self.cfg.camera_model,
+            )  # [1, N, 2], [1, N, 2, 2]
+
+            dynamic_cam = self._gaussian_overlap_motion_mask(
+                means2d[0],
+                covars2d[0],
+                means_cam[0, :, 2],
+                motion_mask,
+            )
+            dynamic |= dynamic_cam
+
+        return dynamic
+
+    def log_dict(self, payload: Dict, step: int) -> None:
+        if self.wandb_run is not None and len(payload) > 0:
+            wandb.log(payload, step=step)
+
+    def _frame_prefix(self, frame_local_idx: int) -> str:
+        return f"frame_{frame_local_idx:03d}"
+
+    def _log_frame_train_metrics(
+        self,
+        frame_local_idx: int,
+        step: int,
+        *,
+        loss: float,
+        l1loss: float,
+        ssimloss: float,
+        dynamic_ratio: float,
+        num_gaussians: int,
+        lr_means: Optional[float] = None,
+        temporal_stats: Optional[Dict[str, float]] = None,
+    ) -> None:
+        prefix = self._frame_prefix(frame_local_idx)
+        payload = {
+            f"{prefix}/train/loss": float(loss),
+            f"{prefix}/train/l1loss": float(l1loss),
+            f"{prefix}/train/ssimloss": float(ssimloss),
+            f"{prefix}/train/dynamic_ratio": float(dynamic_ratio),
+            f"{prefix}/train/num_gaussians": float(num_gaussians),
+            "train/current_frame": float(frame_local_idx),
+        }
+        if lr_means is not None:
+            payload[f"{prefix}/train/lr_means"] = float(lr_means)
+        if temporal_stats is not None:
+            for k, v in temporal_stats.items():
+                payload[f"{prefix}/train/{k}"] = float(v)
+        self.log_dict(payload, step)
+
+    def _log_frame_val_psnr(self, frame_local_idx: int, step: int, psnr: float) -> None:
+        prefix = self._frame_prefix(frame_local_idx)
+        self.log_dict({f"{prefix}/val/psnr": float(psnr)}, step)
+
+    def _infer_resume_next_frame_from_ckpt_name(self, path: str) -> int:
+        base = os.path.basename(path)
+        if base == "after_iframe.pt":
+            return 1
+        if base == "final.pt":
+            return self.cfg.GOP_size
+        match = re.match(r"frame_(\d+)\.pt$", base)
+        if match is not None:
+            return int(match.group(1)) + 1
+        return 0
+
+    def save_ckpt(
+        self,
+        step: int,
+        name: Optional[str] = None,
+        last_completed_frame_local_idx: Optional[int] = None,
+    ) -> None:
+        ckpt_name = name or f"ckpt_{step}.pt"
+        if last_completed_frame_local_idx is None:
+            next_frame_local_idx = self._infer_resume_next_frame_from_ckpt_name(ckpt_name)
+            last_completed_frame_local_idx = next_frame_local_idx - 1
+        else:
+            next_frame_local_idx = last_completed_frame_local_idx + 1
+
+        data = {
+            "step": int(step),
+            "splats": self.model.splats.state_dict(),
+            "cfg": asdict(self.cfg),
+            "last_completed_frame_local_idx": int(last_completed_frame_local_idx),
+            "next_frame_local_idx": int(next_frame_local_idx),
+            "wandb_run_id": (self.wandb_run.id if self.wandb_run is not None else self.cfg.wandb_run_id),
+        }
+        torch.save(data, os.path.join(self.ckpt_dir, ckpt_name))
+
+    def load_ckpt(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        splat_state = ckpt["splats"]
+        self.model.rebuild_from_state_dict(splat_state)
+        self.model.splats.load_state_dict(splat_state)
+
+        # Rebuild optimizer/scheduler objects on top of the resized ParameterDict.
+        self.optimizers = self.model.create_optimizers(self.cfg.batch_size)
+        self.schedulers = {
+            "means": torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max(self.cfg.pframe_steps, 1))
+            )
+        }
+
+        self.resume_global_step = int(ckpt.get("step", 0))
+        self.resume_next_frame_local_idx = int(
+            ckpt.get("next_frame_local_idx", self._infer_resume_next_frame_from_ckpt_name(path))
+        )
+        self.resume_ckpt_path = path
+
+        ckpt_wandb_run_id = ckpt.get("wandb_run_id", None)
+        if (self.cfg.wandb_run_id is None) and ckpt_wandb_run_id and (self.wandb_run is None):
+            self.cfg.wandb_run_id = str(ckpt_wandb_run_id)
+
+        print(
+            f"Loaded checkpoint from {path}. "
+            f"Resized model to N={self.model.splats['means'].shape[1]} Gaussians, "
+            f"resume global_step={self.resume_global_step}, "
+            f"next_frame_local_idx={self.resume_next_frame_local_idx}."
+        )
+
+    def rasterize_static_splats(
+        self,
+        splats: torch.nn.ParameterDict,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        masks: Optional[Tensor] = None,
+        absgrad: bool = False,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)
+
+        render_colors, render_alphas, info = rasterization(
+            means=splats["means"],
+            quats=F.normalize(splats["quats"], dim=-1),
+            scales=torch.exp(splats["scales"]),
+            opacities=torch.sigmoid(splats["opacities"]),
+            colors=colors,
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            packed=self.cfg.packed,
+            absgrad=absgrad,
+            sparse_grad=False,
+            rasterize_mode="antialiased" if self.cfg.antialiased else "classic",
+            distributed=False,
+            camera_model=self.cfg.camera_model,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            sh_degree=self.cfg.sh_degree,
+            render_mode="RGB",
+        )
+        if masks is not None:
+            render_colors[~masks] = 0
+        return render_colors, render_alphas, info
+
+    def rasterize_frame(
+        self,
+        frame_local_idx: int,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        masks: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        splats = self.model.frame_state(frame_local_idx)
+        colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)
+
+        render_colors, render_alphas, info = rasterization(
+            means=splats["means"],
+            quats=splats["quats"],
+            scales=torch.exp(splats["scales"]),
+            opacities=torch.sigmoid(splats["opacities"]),
+            colors=colors,
+            viewmats=torch.linalg.inv(camtoworlds),
+            Ks=Ks,
+            width=width,
+            height=height,
+            packed=self.cfg.packed,
+            absgrad=False,
+            sparse_grad=False,
+            rasterize_mode="antialiased" if self.cfg.antialiased else "classic",
+            distributed=False,
+            camera_model=self.cfg.camera_model,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            sh_degree=self.cfg.sh_degree,
+            render_mode="RGB",
+        )
+        if masks is not None:
+            render_colors[~masks] = 0
+        return render_colors, render_alphas, info
+
+    def zero_static_grads_for_frame(self, frame_local_idx: int, dynamic_mask: Tensor) -> None:
+        static = ~dynamic_mask
+
+        grad = self.model.splats["means"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+        grad = self.model.splats["scales"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+        grad = self.model.splats["quats"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+        grad = self.model.splats["opacities"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+        grad = self.model.splats["sh0"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+        grad = self.model.splats["shN"].grad
+        if grad is not None:
+            grad[frame_local_idx, static] = 0
+
+    def reset_static_momentum(self, frame_local_idx: int, dynamic_mask: Tensor) -> None:
+        static = ~dynamic_mask
+        for name, opt in self.optimizers.items():
+            p = self.model.splats[name]
+            state = opt.state.get(p, None)
+            if not state:
+                continue
+
+            exp_avg = state.get("exp_avg", None)
+            exp_avg_sq = state.get("exp_avg_sq", None)
+            if exp_avg is None or exp_avg_sq is None:
+                continue
+
+            if name == "opacities":
+                exp_avg[frame_local_idx, static] = 0
+                exp_avg_sq[frame_local_idx, static] = 0
+            else:
+                exp_avg[frame_local_idx, static, ...] = 0
+                exp_avg_sq[frame_local_idx, static, ...] = 0
+
+    def train_iframe(self, global_step: int) -> int:
+        cfg = self.cfg
+        trainset0 = FrameSubset(self.trainset, target_frame=0, gop_size=cfg.GOP_size)
+        valset0 = FrameSubset(self.valset, target_frame=0, gop_size=cfg.GOP_size)
+
+        loader = torch.utils.data.DataLoader(
+            trainset0,
+            batch_size=1,
+            shuffle=True,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+        loader_iter = iter(loader)
+
+        static_splats = self.model.make_static_splats_from_frame(0)
+        static_optimizers = create_optimizers_for_static_splats(
+            static_splats, cfg, self.scene_scale, cfg.batch_size
+        )
+        static_schedulers = {
+            "means": torch.optim.lr_scheduler.ExponentialLR(
+                static_optimizers["means"], gamma=0.01 ** (1.0 / cfg.iframe_steps)
+            )
+        }
+
+        strategy = DefaultStrategy(
+            prune_opa=cfg.strategy_prune_opa,
+            grow_grad2d=cfg.strategy_grow_grad2d,
+            grow_scale3d=cfg.strategy_grow_scale3d,
+            grow_scale2d=cfg.strategy_grow_scale2d,
+            prune_scale3d=cfg.strategy_prune_scale3d,
+            prune_scale2d=cfg.strategy_prune_scale2d,
+            refine_scale2d_stop_iter=cfg.strategy_refine_scale2d_stop_iter,
+            refine_start_iter=cfg.strategy_refine_start_iter,
+            refine_stop_iter=cfg.strategy_refine_stop_iter,
+            reset_every=cfg.strategy_reset_every,
+            refine_every=cfg.strategy_refine_every,
+            pause_refine_after_reset=cfg.strategy_pause_refine_after_reset,
+            revised_opacity=cfg.strategy_revised_opacity,
+            absgrad=cfg.strategy_absgrad,
+            verbose=cfg.strategy_verbose,
+        )
+        strategy_state = strategy.initialize_state(scene_scale=self.scene_scale)
+
+        pbar = tqdm.tqdm(range(cfg.iframe_steps), desc="I-frame")
+        for local_step in pbar:
+            try:
+                data = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(loader)
+                data = next(loader_iter)
+
+            camtoworlds = data["camtoworld"].to(self.device)
+            Ks = data["K"].to(self.device)
+            pixels = data["image"].to(self.device) / 255.0
+            masks = data.get("mask")
+            masks = masks.to(self.device) if masks is not None else None
+            height, width = pixels.shape[1:3]
+
+            renders, alphas, info = self.rasterize_static_splats(
+                static_splats, camtoworlds, Ks, width, height, masks=masks, absgrad=strategy.absgrad
+            )
+            colors = torch.clamp(renders[..., :3], 0.0, 1.0)
+
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=self.device)
+                colors = colors + bkgd * (1.0 - alphas)
+
+            l1loss = F.l1_loss(colors, pixels)
+            ssimloss = 1.0 - fused_ssim(
+                colors.permute(0, 3, 1, 2),
+                pixels.permute(0, 3, 1, 2),
+                padding="valid",
+            )
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            if cfg.scale_reg > 0.0:
+                loss = loss + cfg.scale_reg * torch.abs(torch.exp(static_splats["scales"])).mean()
+
+            for opt in static_optimizers.values():
+                opt.zero_grad(set_to_none=True)
+
+            strategy.step_pre_backward(static_splats, static_optimizers, strategy_state, local_step, info)
+            loss.backward()
+            strategy.step_post_backward(static_splats, static_optimizers, strategy_state, local_step, info, packed=cfg.packed)
+
+            for opt in static_optimizers.values():
+                opt.step()
+            for sched in static_schedulers.values():
+                sched.step()
+
+            pbar.set_description(f"I-frame loss={loss.item():.4f} l1={l1loss.item():.4f} ssim={ssimloss.item():.4f}")
+
+            if local_step % cfg.log_every == 0:
+                self._log_frame_train_metrics(
+                    0,
+                    global_step,
+                    loss=float(loss.item()),
+                    l1loss=float(l1loss.item()),
+                    ssimloss=float(ssimloss.item()),
+                    dynamic_ratio=1.0,
+                    num_gaussians=int(static_splats["means"].shape[0]),
+                    lr_means=float(static_optimizers["means"].param_groups[0]["lr"]),
+                )
+
+            global_step += 1
+
+            if (local_step + 1) in cfg.iframe_eval_steps:
+                psnr0 = self.eval_static_frame_subset(static_splats, valset0)
+                self._log_frame_val_psnr(0, global_step, float(psnr0))
+
+        self.model.repeat_from_static_splats(static_splats)
+
+        self.optimizers = self.model.create_optimizers(cfg.batch_size)
+        self.schedulers = {
+            "means": torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max(cfg.pframe_steps, 1))
+            )
+        }
+
+        if cfg.save_stage_ckpts:
+            self.save_ckpt(global_step, "after_iframe.pt", last_completed_frame_local_idx=0)
+
+        return global_step
+
+    def train_one_pframe(self, frame_local_idx: int, global_step: int) -> int:
+        cfg = self.cfg
+        abs_frame_idx = cfg.start_frame + frame_local_idx
+
+        self.model.copy_frame(frame_local_idx - 1, frame_local_idx)
+
+        self.optimizers = self.model.create_optimizers(cfg.batch_size)
+        self.schedulers = {
+            "means": torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizers["means"], gamma=0.01 ** (1.0 / max(cfg.pframe_steps, 1))
+            )
+        }
+
+        self.motion_mask_cache.clear()
+        if cfg.use_flow_guided_labeling:
+            dynamic_mask = self.label_dynamic_gaussians(abs_frame_idx)
+        else:
+            dynamic_mask = torch.ones(
+                self.model.splats["means"].shape[1], dtype=torch.bool, device=self.device
+            )
+
+        num_dynamic = int(dynamic_mask.sum().item())
+        num_total = int(dynamic_mask.numel())
+        dynamic_ratio = float(num_dynamic / max(num_total, 1))
+
+        train_subset = FrameSubset(self.trainset, target_frame=frame_local_idx, gop_size=cfg.GOP_size)
+        loader = torch.utils.data.DataLoader(
+            train_subset,
+            batch_size=1,
+            shuffle=True,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+        loader_iter = iter(loader)
+
+        pbar = tqdm.tqdm(range(cfg.pframe_steps), desc=f"P-frame {frame_local_idx:03d}")
+        for local_step in pbar:
+            try:
+                data = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(loader)
+                data = next(loader_iter)
+
+            camtoworlds = data["camtoworld"].to(self.device)
+            Ks = data["K"].to(self.device)
+            pixels = data["image"].to(self.device) / 255.0
+            masks = data.get("mask")
+            masks = masks.to(self.device) if masks is not None else None
+            height, width = pixels.shape[1:3]
+
+            renders, alphas, _ = self.rasterize_frame(
+                frame_local_idx=frame_local_idx,
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                masks=masks,
+            )
+            colors = torch.clamp(renders[..., :3], 0.0, 1.0)
+
+            if cfg.random_bkgd:
+                bkgd = torch.rand(1, 3, device=self.device)
+                colors = colors + bkgd * (1.0 - alphas)
+
+            l1loss = F.l1_loss(colors, pixels)
+            ssimloss = 1.0 - fused_ssim(
+                colors.permute(0, 3, 1, 2),
+                pixels.permute(0, 3, 1, 2),
+                padding="valid",
+            )
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+            if cfg.scale_reg > 0.0:
+                loss = loss + cfg.scale_reg * torch.abs(torch.exp(self.model.splats["scales"][frame_local_idx])).mean()
+
+            temporal_stats = {}
+            if cfg.enable_temporal_loss:
+                temporal_loss, temporal_stats = compute_temporal_regularization(self.model, frame_local_idx, cfg)
+                loss = loss + temporal_loss
+
+            for opt in self.optimizers.values():
+                opt.zero_grad(set_to_none=True)
+
+            loss.backward()
+
+            if cfg.freeze_static_gaussians:
+                self.zero_static_grads_for_frame(frame_local_idx, dynamic_mask)
+
+            if cfg.freeze_static_gaussians and cfg.reset_static_momentum_every > 0 and (local_step % cfg.reset_static_momentum_every == 0):
+                self.reset_static_momentum(frame_local_idx, dynamic_mask)
+
+            for opt in self.optimizers.values():
+                opt.step()
+            for sched in self.schedulers.values():
+                sched.step()
+
+            pbar.set_description(
+                f"P{frame_local_idx:03d} loss={loss.item():.4f} l1={l1loss.item():.4f} ssim={ssimloss.item():.4f} dyn={dynamic_ratio:.3f}"
+            )
+
+            if local_step % cfg.log_every == 0:
+                self._log_frame_train_metrics(
+                    frame_local_idx,
+                    global_step,
+                    loss=float(loss.item()),
+                    l1loss=float(l1loss.item()),
+                    ssimloss=float(ssimloss.item()),
+                    dynamic_ratio=dynamic_ratio,
+                    num_gaussians=int(self.model.splats["means"].shape[1]),
+                    lr_means=float(self.optimizers["means"].param_groups[0]["lr"]),
+                    temporal_stats=temporal_stats,
+                )
+
+            global_step += 1
+
+            if (local_step + 1) % cfg.pframe_eval_every == 0 or (local_step + 1) == cfg.pframe_steps:
+                psnr_t = self.eval_single_frame(frame_local_idx)
+                self._log_frame_val_psnr(frame_local_idx, global_step, float(psnr_t))
+
+        self.motion_mask_cache.clear()
+
+        if cfg.save_stage_ckpts:
+            self.save_ckpt(global_step, f"frame_{frame_local_idx:03d}.pt", last_completed_frame_local_idx=frame_local_idx)
+
+        return global_step
+
+    @torch.no_grad()
+    def eval_static_frame_subset(self, static_splats: torch.nn.ParameterDict, subset: FrameSubset) -> float:
+        loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False, num_workers=1)
+        psnrs = []
+        for data in loader:
+            camtoworlds = data["camtoworld"].to(self.device)
+            Ks = data["K"].to(self.device)
+            pixels = data["image"].to(self.device) / 255.0
+            masks = data.get("mask")
+            masks = masks.to(self.device) if masks is not None else None
+            height, width = pixels.shape[1:3]
+
+            renders, _, _ = self.rasterize_static_splats(static_splats, camtoworlds, Ks, width, height, masks=masks, absgrad=False)
+            colors = torch.clamp(renders[..., :3], 0.0, 1.0)
+            mse = F.mse_loss(colors, pixels)
+            psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+            psnrs.append(float(psnr.item()))
+        return float(np.mean(psnrs))
+
+    @torch.no_grad()
+    def eval_single_frame(self, frame_local_idx: int) -> float:
+        subset = FrameSubset(self.valset, target_frame=frame_local_idx, gop_size=self.cfg.GOP_size)
+        loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False, num_workers=1)
+        psnrs = []
+
+        for data in loader:
+            camtoworlds = data["camtoworld"].to(self.device)
+            Ks = data["K"].to(self.device)
+            pixels = data["image"].to(self.device) / 255.0
+            masks = data.get("mask")
+            masks = masks.to(self.device) if masks is not None else None
+            height, width = pixels.shape[1:3]
+
+            renders, _, _ = self.rasterize_frame(
+                frame_local_idx=frame_local_idx,
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                masks=masks,
+            )
+            colors = torch.clamp(renders[..., :3], 0.0, 1.0)
+            mse = F.mse_loss(colors, pixels)
+            psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+            psnrs.append(float(psnr.item()))
+
+        mean_psnr = float(np.mean(psnrs))
+        return mean_psnr
+
+
+    def train(self) -> None:
+        global_step = int(self.resume_global_step)
+        start_frame_local_idx = int(self.resume_next_frame_local_idx)
+
+        if start_frame_local_idx <= 0:
+            global_step = self.train_iframe(global_step)
+            start_frame_local_idx = 1
+        else:
+            print(
+                f"Skipping I-frame training and resuming from P-frame {start_frame_local_idx:03d} "
+                f"using checkpoint {self.resume_ckpt_path}."
+            )
+
+        for frame_local_idx in range(start_frame_local_idx, self.cfg.GOP_size):
+            global_step = self.train_one_pframe(frame_local_idx, global_step)
+
+        self.save_ckpt(global_step, "final.pt", last_completed_frame_local_idx=self.cfg.GOP_size - 1)
+        print("Training finished.")
+
+
+def main() -> None:
+    cfg = tyro.cli(Config)
+    runner = Runner(cfg)
+    runner.train()
+
+
+if __name__ == "__main__":
+    main()

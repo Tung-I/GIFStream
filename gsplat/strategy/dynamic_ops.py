@@ -7,6 +7,14 @@ from typing import Callable, Dict, List, Union
 from gsplat.utils import normalized_quat_to_rotmat
 
 
+def _is_gaussian_axis0_state(v: Tensor, n: int) -> bool:
+    return v.ndim >= 1 and v.shape[0] == n
+
+
+def _is_gaussian_axis1_state(v: Tensor, n: int) -> bool:
+    return v.ndim >= 2 and v.shape[1] == n
+
+
 @torch.no_grad()
 def _update_param_with_optimizer_dim1(
     param_fn: Callable[[str, Tensor], Tensor],
@@ -51,25 +59,27 @@ def dynamic_duplicate(
 ):
     device = mask.device
     sel = torch.where(mask)[0]
+    n = mask.shape[0]
 
     if sel.numel() == 0:
         return
 
     def param_fn(name: str, p: Tensor) -> Tensor:
-        # p is [T, N, ...]
         p_new = torch.cat([p, p[:, sel].clone()], dim=1)
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        # optimizer states have same shape as params
         zeros = torch.zeros_like(v[:, sel], device=device)
         return torch.cat([v, zeros], dim=1)
 
     _update_param_with_optimizer_dim1(param_fn, optimizer_fn, params, optimizers)
 
-    # state tensors are [N]
     for k, v in state.items():
-        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == mask.shape[0]:
+        if not isinstance(v, torch.Tensor):
+            continue
+        if _is_gaussian_axis1_state(v, n):
+            state[k] = torch.cat([v, v[:, sel]], dim=1)
+        elif _is_gaussian_axis0_state(v, n):
             state[k] = torch.cat([v, v[sel]], dim=0)
 
 
@@ -81,6 +91,7 @@ def dynamic_remove(
     mask: Tensor,  # [N], True means remove
 ):
     keep = torch.where(~mask)[0]
+    n = mask.shape[0]
     if keep.numel() == mask.numel():
         return
 
@@ -94,7 +105,11 @@ def dynamic_remove(
     _update_param_with_optimizer_dim1(param_fn, optimizer_fn, params, optimizers)
 
     for k, v in state.items():
-        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == mask.shape[0]:
+        if not isinstance(v, torch.Tensor):
+            continue
+        if _is_gaussian_axis1_state(v, n):
+            state[k] = v[:, keep]
+        elif _is_gaussian_axis0_state(v, n):
             state[k] = v[keep]
 
 
@@ -131,11 +146,11 @@ def dynamic_split(
     device = mask.device
     sel = torch.where(mask)[0]
     rest = torch.where(~mask)[0]
+    n = mask.shape[0]
 
     if sel.numel() == 0:
         return
 
-    # params are [T, N, ...]
     scales = torch.exp(params["scales"][:, sel])              # [T, S, 3]
     quats = F.normalize(params["quats"][:, sel], dim=-1)      # [T, S, 4]
     T, S = scales.shape[:2]
@@ -150,8 +165,7 @@ def dynamic_split(
     parent_means = params["means"][:, sel]                    # [T, S, 3]
     child_means_0 = parent_means + samples[:, 0]
     child_means_1 = parent_means + samples[:, 1]
-
-    child_scales = torch.log(scales / 1.6)                    # [T, S, 3]
+    child_scales = torch.log((scales / 1.6).clamp_min(1e-12))
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         base = p[:, rest]
@@ -177,5 +191,9 @@ def dynamic_split(
     _update_param_with_optimizer_dim1(param_fn, optimizer_fn, params, optimizers)
 
     for k, v in state.items():
-        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == mask.shape[0]:
+        if not isinstance(v, torch.Tensor):
+            continue
+        if _is_gaussian_axis1_state(v, n):
+            state[k] = torch.cat([v[:, rest], v[:, sel], v[:, sel]], dim=1)
+        elif _is_gaussian_axis0_state(v, n):
             state[k] = torch.cat([v[rest], v[sel], v[sel]], dim=0)
